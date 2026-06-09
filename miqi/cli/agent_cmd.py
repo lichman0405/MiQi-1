@@ -181,7 +181,6 @@ def register_agent_command(
             console.print(f"  [dim]↳ {content}[/dim]")
 
         async def on_cron_job(job) -> str | None:
-            from miqi.bus.events import OutboundMessage
             response = await agent_loop.process_direct(
                 job.payload.message,
                 session_key=f"cron:{job.id}",
@@ -189,13 +188,20 @@ def register_agent_command(
                 chat_id=job.payload.to or "direct",
             )
             if job.payload.deliver and job.payload.to:
-                await bus.publish_outbound(
-                    OutboundMessage(
-                        channel=job.payload.channel or "cli",
-                        chat_id=job.payload.to,
-                        content=response or "",
+                if runtime_choice == "kun":
+                    logger.info(
+                        "Cron job {} deliver skipped (KUN CLI mode — "
+                        "no outbound channel)", job.id,
                     )
-                )
+                else:
+                    from miqi.bus.events import OutboundMessage
+                    await bus.publish_outbound(
+                        OutboundMessage(
+                            channel=job.payload.channel or "cli",
+                            chat_id=job.payload.to,
+                            content=response or "",
+                        )
+                    )
             return response
 
         cron.on_job = on_cron_job
@@ -208,6 +214,55 @@ def register_agent_command(
                 await agent_loop.close_mcp()
 
             asyncio.run(run_once())
+        elif runtime_choice == "kun":
+            # KUN interactive mode — direct process_direct calls, no bus
+            init_prompt_session()
+            console.print(
+                f"{logo} Interactive mode [KUN] (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n"
+            )
+
+            def _exit_on_sigint(signum, frame):
+                agent_loop.stop()
+                restore_terminal()
+                console.print("\nGoodbye!")
+                os._exit(0)
+
+            signal.signal(signal.SIGINT, _exit_on_sigint)
+
+            async def run_interactive_kun():
+                await cron.start()
+                try:
+                    while True:
+                        try:
+                            flush_pending_tty_input()
+                            user_input = await read_interactive_input_async()
+                            command = user_input.strip()
+                            if not command:
+                                continue
+
+                            if is_exit_command(command):
+                                restore_terminal()
+                                console.print("\nGoodbye!")
+                                break
+
+                            with _thinking_ctx():
+                                response = await agent_loop.process_direct(
+                                    command, session_id, on_progress=_cli_progress,
+                                )
+                            print_agent_response(response, render_markdown=markdown)
+                        except KeyboardInterrupt:
+                            restore_terminal()
+                            console.print("\nGoodbye!")
+                            break
+                        except EOFError:
+                            restore_terminal()
+                            console.print("\nGoodbye!")
+                            break
+                finally:
+                    agent_loop.stop()
+                    await agent_loop.close_mcp()
+
+            asyncio.run(run_interactive_kun())
         else:
             from miqi.bus.events import InboundMessage
 
