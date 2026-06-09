@@ -29,8 +29,13 @@ class FeishuChannel(BaseChannel):
 
     name = "feishu"
 
-    def __init__(self, config: FeishuChannelConfig, bus: MessageBus):
-        super().__init__(config, bus)
+    def __init__(
+        self,
+        config: FeishuChannelConfig,
+        bus: Any = None,
+        on_message: Any = None,
+    ):
+        super().__init__(config, bus=bus, on_message=on_message)
         self.config: FeishuChannelConfig = config
         self._ws_thread: threading.Thread | None = None
         self._ws_client: Any = None   # lark.ws.Client — assigned on start()

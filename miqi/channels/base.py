@@ -1,12 +1,13 @@
 """Base channel interface for chat platforms."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable, Coroutine
 
 from loguru import logger
 
 from miqi.bus.events import InboundMessage, OutboundMessage
-from miqi.bus.queue import MessageBus
 
 
 class BaseChannel(ABC):
@@ -15,20 +16,32 @@ class BaseChannel(ABC):
 
     Each channel (Telegram, Discord, etc.) should implement this interface
     to integrate with the runtime message bus.
+
+    Two modes are supported:
+
+    - **bus mode** (legacy): inbound messages are published to a ``MessageBus``.
+    - **callback mode** (KUN): inbound messages are delivered via ``on_message``.
     """
 
     name: str = "base"
 
-    def __init__(self, config: Any, bus: MessageBus):
+    def __init__(
+        self,
+        config: Any,
+        bus: Any = None,
+        on_message: Callable[[InboundMessage], Coroutine[Any, Any, None]] | None = None,
+    ):
         """
         Initialize the channel.
 
         Args:
             config: Channel-specific configuration.
-            bus: The message bus for communication.
+            bus: The message bus for communication (optional in callback mode).
+            on_message: Callback for inbound messages (optional, KUN mode).
         """
         self.config = config
         self.bus = bus
+        self.on_message = on_message
         self._running = False
         # SEC-08: Warn operators when no access control list is configured.
         if not getattr(config, "allow_from", None):
@@ -104,7 +117,7 @@ class BaseChannel(ABC):
         """
         Handle an incoming message from the chat platform.
 
-        This method checks permissions and forwards to the bus.
+        This method checks permissions and forwards to the bus or on_message callback.
 
         Args:
             sender_id: The sender's identifier.
@@ -134,7 +147,12 @@ class BaseChannel(ABC):
             sender_name=sender_name,
         )
 
-        await self.bus.publish_inbound(msg)
+        if self.on_message:
+            await self.on_message(msg)
+        elif self.bus:
+            await self.bus.publish_inbound(msg)
+        else:
+            logger.warning("No bus or on_message callback — message dropped")
 
     @property
     def is_running(self) -> bool:

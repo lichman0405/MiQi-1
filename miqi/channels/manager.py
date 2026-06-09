@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, Callable, Coroutine
 
 from loguru import logger
 
-from miqi.bus.queue import MessageBus
+from miqi.bus.events import InboundMessage
 from miqi.channels.base import BaseChannel
 from miqi.config.schema import Config
 
@@ -20,11 +20,23 @@ class ChannelManager:
     - Initialize enabled channels
     - Start/stop channels
     - Route outbound messages
+
+    Two modes are supported:
+
+    - **bus mode** (legacy): outbound messages are dispatched via ``MessageBus``.
+    - **callback mode** (KUN): inbound messages go to ``on_message``, outbound
+      dispatch is skipped (channels send directly via their ``send()`` method).
     """
 
-    def __init__(self, config: Config, bus: MessageBus):
+    def __init__(
+        self,
+        config: Config,
+        bus: Any = None,
+        on_message: Callable[[InboundMessage], Coroutine[Any, Any, None]] | None = None,
+    ):
         self.config = config
         self.bus = bus
+        self.on_message = on_message
         self.channels: dict[str, BaseChannel] = {}
         self._dispatch_task: asyncio.Task | None = None
 
@@ -34,7 +46,11 @@ class ChannelManager:
         """Initialize channels based on config."""
         if self.config.channels.feishu.enabled:
             from miqi.channels.feishu import FeishuChannel
-            self.channels["feishu"] = FeishuChannel(self.config.channels.feishu, self.bus)
+            self.channels["feishu"] = FeishuChannel(
+                self.config.channels.feishu,
+                bus=self.bus,
+                on_message=self.on_message,
+            )
             logger.info("Feishu channel enabled")
 
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
@@ -83,7 +99,14 @@ class ChannelManager:
                 logger.error("Error stopping {}: {}", name, e)
 
     async def _dispatch_outbound(self) -> None:
-        """Dispatch outbound messages to the appropriate channel."""
+        """Dispatch outbound messages to the appropriate channel.
+
+        In callback mode (no bus), this is a no-op — channels handle outbound
+        messages through their direct ``send()`` method.
+        """
+        if not self.bus:
+            logger.info("Outbound dispatcher skipped (callback mode — no bus)")
+            return
         logger.info("Outbound dispatcher started")
 
         while True:
