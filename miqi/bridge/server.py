@@ -481,8 +481,67 @@ def handle_chat_abort(req_id: str, params: dict) -> None:
     _result(req_id, {"aborted": aborted})
 
 
+def _kun_sessions_list(include_archived: bool = False) -> list[dict]:
+    """List sessions from KUN FileThreadStore, returning legacy-compatible format."""
+    import asyncio as _asyncio
+    from miqi.config.loader import get_data_dir
+    from miqi.kun_runtime.stores import FileThreadStore
+
+    store = FileThreadStore(get_data_dir() / "kun_runtime")
+
+    async def _fetch():
+        return await store.list()
+
+    threads = _asyncio.run(_fetch())
+
+    result = []
+    for t in threads:
+        archived = t.get("archived", False)
+        if not include_archived and archived:
+            continue
+        # Convert KUN camelCase keys to legacy snake_case keys
+        result.append({
+            "session_key": t["id"],
+            "title": t.get("title", t["id"]),
+            "updated_at": t.get("updatedAt", ""),
+            "archived": archived,
+            "message_count": 0,
+            "workspace": t.get("workspace", ""),
+            "model": t.get("model", ""),
+        })
+    # Sort by updated_at descending (newest first)
+    result.sort(key=lambda x: x["updated_at"], reverse=True)
+    return result
+
+
+def _kun_set_archived(session_key: str, archived: bool) -> None:
+    """Set the archived flag on a KUN thread via FileThreadStore."""
+    import asyncio as _asyncio
+    from miqi.config.loader import get_data_dir
+    from miqi.kun_runtime.stores import FileThreadStore
+
+    store = FileThreadStore(get_data_dir() / "kun_runtime")
+
+    async def _update():
+        thread = await store.get(session_key)
+        if not thread:
+            raise ValueError(f"Session not found: {session_key}")
+        thread["archived"] = archived
+        await store.upsert(thread)
+
+    _asyncio.run(_update())
+
+
 def handle_sessions_list(req_id: str, params: dict) -> None:
     config = _state.load_config()
+    if _state.runtime_mode == "kun":
+        try:
+            sessions = _kun_sessions_list(include_archived=False)
+            _result(req_id, {"sessions": sessions})
+        except Exception as exc:
+            _error(req_id, str(exc))
+        return
+    # legacy path
     from miqi.session.manager import SessionManager
 
     sm = SessionManager(config.workspace_path)
@@ -491,8 +550,48 @@ def handle_sessions_list(req_id: str, params: dict) -> None:
 
 
 def handle_sessions_get(req_id: str, params: dict) -> None:
-    session_key = params["session_key"]
+    session_key = params.get("session_key") or params.get("session_id", "")
     config = _state.load_config()
+    if _state.runtime_mode == "kun":
+        import asyncio as _asyncio
+        from miqi.config.loader import get_data_dir
+        from miqi.kun_runtime.stores import FileSessionStore, FileThreadStore
+
+        try:
+            thread_store = FileThreadStore(get_data_dir() / "kun_runtime")
+            session_store = FileSessionStore(get_data_dir() / "kun_runtime")
+
+            async def _fetch():
+                thread = await thread_store.get(session_key)
+                items = await session_store.load_items(session_key)
+                return thread, items
+
+            thread, items = _asyncio.run(_fetch())
+            if not thread:
+                _error(req_id, f"Session not found: {session_key}")
+                return
+
+            # Convert KUN turn items to legacy message format
+            messages = []
+            for item in items:
+                kind = item.get("kind", "")
+                if kind == "user_message":
+                    messages.append({"role": "user", "content": item.get("text", "")})
+                elif kind == "assistant_text":
+                    messages.append({"role": "assistant", "content": item.get("text", "")})
+                # tool_call / tool_result skipped for now — not needed for main display
+
+            _result(req_id, {
+                "session_key": session_key,
+                "title": thread.get("title", session_key),
+                "messages": messages,
+                "updated_at": thread.get("updatedAt", ""),
+                "archived": thread.get("archived", False),
+            })
+        except Exception as exc:
+            _error(req_id, str(exc))
+        return
+    # legacy path
     from miqi.session.manager import SessionManager
 
     sm = SessionManager(config.workspace_path)
@@ -507,8 +606,23 @@ def handle_sessions_get(req_id: str, params: dict) -> None:
 
 
 def handle_sessions_delete(req_id: str, params: dict) -> None:
-    session_key = params["session_key"]
+    session_key = params.get("session_key", "")
     config = _state.load_config()
+    if _state.runtime_mode == "kun":
+        import asyncio as _asyncio
+        from miqi.config.loader import get_data_dir
+        from miqi.kun_runtime.stores import FileThreadStore
+
+        try:
+            store = FileThreadStore(get_data_dir() / "kun_runtime")
+            deleted = _asyncio.run(store.delete(session_key))
+            # Also destroy sandbox for this session
+            _state.destroy_sandbox(session_key)
+            _result(req_id, {"deleted": deleted})
+        except Exception as exc:
+            _error(req_id, str(exc))
+        return
+    # legacy path
     from miqi.session.manager import SessionManager
 
     sm = SessionManager(config.workspace_path)
@@ -523,6 +637,14 @@ def handle_sessions_archive(req_id: str, params: dict) -> None:
     session_key = params.get("session_key", "")
     if not session_key:
         _error(req_id, "session_key is required")
+        return
+    if _state.runtime_mode == "kun":
+        try:
+            _kun_set_archived(session_key, True)
+            _state.destroy_sandbox(session_key)
+            _result(req_id, {"archived": True})
+        except Exception as exc:
+            _error(req_id, str(exc))
         return
     try:
         sm = _get_session_manager()
@@ -540,6 +662,13 @@ def handle_sessions_unarchive(req_id: str, params: dict) -> None:
     if not session_key:
         _error(req_id, "session_key is required")
         return
+    if _state.runtime_mode == "kun":
+        try:
+            _kun_set_archived(session_key, False)
+            _result(req_id, {"unarchived": True})
+        except Exception as exc:
+            _error(req_id, str(exc))
+        return
     try:
         sm = _get_session_manager()
         sm.unarchive(session_key)
@@ -550,6 +679,15 @@ def handle_sessions_unarchive(req_id: str, params: dict) -> None:
 
 def handle_sessions_list_archived(req_id: str, params: dict) -> None:
     """List only archived sessions."""
+    if _state.runtime_mode == "kun":
+        try:
+            sessions = _kun_sessions_list(include_archived=True)
+            archived = [s for s in sessions if s["archived"]]
+            _result(req_id, {"sessions": archived})
+        except Exception as exc:
+            _error(req_id, str(exc))
+        return
+    # legacy path
     try:
         sm = _get_session_manager()
         sessions = sm.list_sessions(include_archived=True)
