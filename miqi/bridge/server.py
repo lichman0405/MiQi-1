@@ -481,8 +481,26 @@ def handle_chat_abort(req_id: str, params: dict) -> None:
     _result(req_id, {"aborted": aborted})
 
 
+def _kun_resolve_thread_id(session_key: str) -> str:
+    """Map a MiQi session_key (``channel:chat_id``) to a KUN thread ID.
+
+    Uses the same deterministic hashing as ``migration_adapter._make_thread_id``
+    so that the bridge and the KUN runtime always agree on the mapping, even
+    when ``process_direct`` has never been called for this session_key.
+    """
+    from miqi.kun_runtime.migration_adapter import session_key_to_thread_id
+
+    return session_key_to_thread_id(session_key)
+
+
 def _kun_sessions_list(include_archived: bool = False) -> list[dict]:
-    """List sessions from KUN FileThreadStore, returning legacy-compatible format."""
+    """List sessions from KUN FileThreadStore, returning legacy-compatible format.
+
+    The ``key`` field is the **original MiQi session key** (stored in the
+    thread ``title``), NOT the KUN thread ID.  This matches what the frontend
+    ``SessionInfo.key`` expects and ensures clicking a session item correctly
+    restores the conversation.
+    """
     import asyncio as _asyncio
     from miqi.config.loader import get_data_dir
     from miqi.kun_runtime.stores import FileThreadStore
@@ -494,14 +512,20 @@ def _kun_sessions_list(include_archived: bool = False) -> list[dict]:
 
     threads = _asyncio.run(_fetch())
 
-    result = []
+    seen: set[str] = set()
+    result: list[dict] = []
     for t in threads:
         archived = t.get("archived", False)
         if not include_archived and archived:
             continue
-        # Convert KUN camelCase keys to legacy snake_case keys
+        # Use thread title as the session key (it's the original MiQi key)
+        key = t.get("title", "") or t["id"]
+        # Dedup: if two threads somehow share the same key, keep newest
+        if key in seen:
+            continue
+        seen.add(key)
         result.append({
-            "session_key": t["id"],
+            "key": key,
             "title": t.get("title", t["id"]),
             "updated_at": t.get("updatedAt", ""),
             "archived": archived,
@@ -520,10 +544,11 @@ def _kun_set_archived(session_key: str, archived: bool) -> None:
     from miqi.config.loader import get_data_dir
     from miqi.kun_runtime.stores import FileThreadStore
 
+    thread_id = _kun_resolve_thread_id(session_key)
     store = FileThreadStore(get_data_dir() / "kun_runtime")
 
     async def _update():
-        thread = await store.get(session_key)
+        thread = await store.get(thread_id)
         if not thread:
             raise ValueError(f"Session not found: {session_key}")
         thread["archived"] = archived
@@ -558,12 +583,13 @@ def handle_sessions_get(req_id: str, params: dict) -> None:
         from miqi.kun_runtime.stores import FileSessionStore, FileThreadStore
 
         try:
+            thread_id = _kun_resolve_thread_id(session_key)
             thread_store = FileThreadStore(get_data_dir() / "kun_runtime")
             session_store = FileSessionStore(get_data_dir() / "kun_runtime")
 
             async def _fetch():
-                thread = await thread_store.get(session_key)
-                items = await session_store.load_items(session_key)
+                thread = await thread_store.get(thread_id)
+                items = await session_store.load_items(thread_id)
                 return thread, items
 
             thread, items = _asyncio.run(_fetch())
@@ -582,7 +608,7 @@ def handle_sessions_get(req_id: str, params: dict) -> None:
                 # tool_call / tool_result skipped for now — not needed for main display
 
             _result(req_id, {
-                "session_key": session_key,
+                "key": session_key,
                 "title": thread.get("title", session_key),
                 "messages": messages,
                 "updated_at": thread.get("updatedAt", ""),
@@ -614,8 +640,9 @@ def handle_sessions_delete(req_id: str, params: dict) -> None:
         from miqi.kun_runtime.stores import FileThreadStore
 
         try:
+            thread_id = _kun_resolve_thread_id(session_key)
             store = FileThreadStore(get_data_dir() / "kun_runtime")
-            deleted = _asyncio.run(store.delete(session_key))
+            deleted = _asyncio.run(store.delete(thread_id))
             # Also destroy sandbox for this session
             _state.destroy_sandbox(session_key)
             _result(req_id, {"deleted": deleted})

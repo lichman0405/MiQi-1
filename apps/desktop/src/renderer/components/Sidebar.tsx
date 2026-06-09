@@ -72,7 +72,29 @@ export function Sidebar({
     setLoading(true)
     try {
       const r = await window.miqi.sessions.list()
-      setSessions(r?.sessions ?? [])
+      const raw: SessionInfo[] = r?.sessions ?? []
+      // Dedup by key — keep the one with the latest updated_at
+      const seen = new Map<string, SessionInfo>()
+      const valid: SessionInfo[] = []
+      for (const s of raw) {
+        if (!s.key) {
+          console.error('[Sidebar] session item missing key — dropped', s)
+          continue
+        }
+        const existing = seen.get(s.key)
+        if (existing) {
+          // Keep the newer one
+          const keep = (s.updated_at ?? '') > (existing.updated_at ?? '') ? s : existing
+          seen.set(s.key, keep)
+        } else {
+          seen.set(s.key, s)
+        }
+      }
+      // Convert map back to array, sort by updated_at desc
+      const deduped = [...seen.values()].sort(
+        (a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? ''),
+      )
+      setSessions(deduped)
     } catch {
       /* Bridge not available */
     }
