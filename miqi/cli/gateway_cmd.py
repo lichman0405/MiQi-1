@@ -140,6 +140,31 @@ def register_gateway_command(
                 mcp_servers=config.tools.mcp_servers,
             )
             console.print("[green]✓[/green] Runtime: KUN (desktop-workbench engine)")
+
+            # KUN: ChannelManager with on_message callback (no bus)
+            from miqi.bus.events import InboundMessage as _Inbound, OutboundMessage as _Outbound  # noqa: F811
+
+            async def _on_channel_message(msg: _Inbound) -> None:
+                session_key = f"{msg.channel}:{msg.chat_id}"
+                response = await agent.process_direct(
+                    content=msg.content,
+                    session_key=session_key,
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                )
+                if response:
+                    ch = channel_manager.get_channel(msg.channel)
+                    if ch:
+                        await ch.send(_Outbound(
+                            channel=msg.channel,
+                            chat_id=msg.chat_id,
+                            content=response,
+                        ))
+
+            channel_manager = ChannelManager(
+                config=config,
+                on_message=_on_channel_message,
+            )
         else:
             agent = AgentLoop(
                 bus=bus,
@@ -167,6 +192,8 @@ def register_gateway_command(
                 channels_config=config.channels,
             )
 
+            channel_manager = ChannelManager(config, bus)
+
         async def on_cron_job(job: CronJob) -> str | None:
             response = await agent.process_direct(
                 job.payload.message,
@@ -175,23 +202,21 @@ def register_gateway_command(
                 chat_id=job.payload.to or "direct",
             )
             if job.payload.deliver and job.payload.to:
-                from miqi.bus.events import OutboundMessage
+                ch = channel_manager.get_channel(job.payload.channel or "")
+                if ch:
+                    from miqi.bus.events import OutboundMessage
 
-                await bus.publish_outbound(
-                    OutboundMessage(
+                    await ch.send(OutboundMessage(
                         channel=job.payload.channel or "cli",
                         chat_id=job.payload.to,
                         content=response or "",
-                    )
-                )
+                    ))
             return response
 
         cron.on_job = on_cron_job
 
-        channels = ChannelManager(config, bus)
-
         def _pick_heartbeat_target() -> tuple[str, str]:
-            enabled = set(channels.enabled_channels)
+            enabled = set(channel_manager.enabled_channels)
             for item in session_manager.list_sessions():
                 key = item.get("key") or ""
                 if ":" not in key:
@@ -218,14 +243,21 @@ def register_gateway_command(
             )
 
         async def on_heartbeat_notify(response: str) -> None:
-            from miqi.bus.events import OutboundMessage
-
             channel, chat_id = _pick_heartbeat_target()
             if channel == "cli":
                 return
-            await bus.publish_outbound(
-                OutboundMessage(channel=channel, chat_id=chat_id, content=response)
-            )
+            if runtime_choice == "kun":
+                ch = channel_manager.get_channel(channel)
+                if ch:
+                    from miqi.bus.events import OutboundMessage
+                    await ch.send(OutboundMessage(
+                        channel=channel, chat_id=chat_id, content=response,
+                    ))
+            else:
+                from miqi.bus.events import OutboundMessage
+                await bus.publish_outbound(
+                    OutboundMessage(channel=channel, chat_id=chat_id, content=response)
+                )
 
         heartbeat_interval_s = max(1, config.heartbeat.interval_seconds)
         heartbeat = HeartbeatService(
@@ -236,8 +268,8 @@ def register_gateway_command(
             enabled=config.heartbeat.enabled,
         )
 
-        if channels.enabled_channels:
-            console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+        if channel_manager.enabled_channels:
+            console.print(f"[green]✓[/green] Channels enabled: {', '.join(channel_manager.enabled_channels)}")
         else:
             console.print("[yellow]Warning: No channels enabled[/yellow]")
 
@@ -260,10 +292,16 @@ def register_gateway_command(
                     console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
                 await heartbeat.start()
-                await asyncio.gather(
-                    agent.run(),
-                    channels.start_all(),
-                )
+                if runtime_choice == "kun":
+                    # KUN is turn-driven — no long-running agent.run()
+                    await asyncio.gather(
+                        channel_manager.start_all(),
+                    )
+                else:
+                    await asyncio.gather(
+                        agent.run(),
+                        channel_manager.start_all(),
+                    )
             except KeyboardInterrupt:
                 console.print("\nShutting down...")
             finally:
@@ -271,6 +309,6 @@ def register_gateway_command(
                 heartbeat.stop()
                 cron.stop()
                 agent.stop()
-                await channels.stop_all()
+                await channel_manager.stop_all()
 
         asyncio.run(run())
